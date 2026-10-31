@@ -2,27 +2,40 @@ import hashlib
 import os
 import argparse
 import logging
+import re
 import time
 import sys
+from datetime import datetime, timezone
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+CHUNK_SIZE = 65536
+CHECKSUM_RE = re.compile(r'^[0-9a-f]{64}$')
+
+def hash_bytes_range(filepath, limit=None):
+    """Hash a file, or its first limit bytes, in fixed size chunks."""
+    hasher = hashlib.sha256()
+    remaining = limit
+    with open(filepath, 'rb') as f:
+        while True:
+            if remaining is not None:
+                if remaining <= 0:
+                    break
+                chunk = f.read(min(CHUNK_SIZE, remaining))
+            else:
+                chunk = f.read(CHUNK_SIZE)
+            if not chunk:
+                break
+            hasher.update(chunk)
+            if remaining is not None:
+                remaining -= len(chunk)
+    return hasher.hexdigest()
+
 def calculate_checksum(filepath):
-    """
-    Calculates the SHA-256 checksum of a file.
-
-    Args:
-        filepath (str): The path to the file.
-
-    Returns:
-        str: The SHA-256 checksum of the file, or None if an error occurred.
-    """
+    """Calculates the SHA-256 checksum of a file in fixed size chunks, or None on error."""
     try:
-        with open(filepath, 'rb') as f:
-            file_content = f.read()
-            sha256_hash = hashlib.sha256(file_content).hexdigest()
-            return sha256_hash
+        return hash_bytes_range(filepath)
     except FileNotFoundError:
         logging.error(f"File not found: {filepath}")
         return None
@@ -33,93 +46,129 @@ def calculate_checksum(filepath):
         logging.error(f"Error calculating checksum for {filepath}: {e}")
         return None
 
-def monitor_file(filepath, initial_checksum=None, interval=60):
-    """
-    Monitors a file for changes in its checksum.
+def snapshot(filepath, prefix_limit=None):
+    """Returns (size, full_hash, prefix_hash) or None if the file cannot be read."""
+    try:
+        size = os.path.getsize(filepath)
+        full_hash = hash_bytes_range(filepath)
+        prefix_hash = hash_bytes_range(filepath, limit=prefix_limit) if prefix_limit is not None else None
+        return size, full_hash, prefix_hash
+    except OSError as e:
+        logging.error(f"Error reading {filepath}: {e}")
+        return None
 
-    Args:
-        filepath (str): The path to the file to monitor.
-        initial_checksum (str, optional): The initial checksum of the file. If None, it's calculated. Defaults to None.
-        interval (int, optional): The interval in seconds to check for changes. Defaults to 60.
-    """
-    if initial_checksum is None:
-        initial_checksum = calculate_checksum(filepath)
-        if initial_checksum is None:
-            logging.error(f"Failed to get initial checksum for {filepath}. Monitoring aborted.")
-            return
+def append_history(state_file, checksum, size):
+    if not state_file:
+        return
+    stamp = datetime.now(timezone.utc).isoformat()
+    with open(state_file, 'a', encoding='utf-8') as f:
+        f.write(f"{stamp} {checksum} size={size}\n")
 
-        logging.info(f"Initial checksum for {filepath}: {initial_checksum}")
+def normalise_checksum(value):
+    """Normalise a supplied checksum to lowercase hex. Returns None if the format is invalid."""
+    if value is None:
+        return None
+    candidate = value.strip().lower()
+    if not CHECKSUM_RE.match(candidate):
+        return None
+    return candidate
+
+def monitor_file(filepath, initial_checksum=None, interval=60, state_file=None):
+    """
+    Monitors a file for integrity changes.
+
+    Pure appends are logged as growth. Shrinkage, or a change to the
+    previously seen prefix, is an integrity alert. A file that becomes
+    missing or unreadable after a successful baseline is an integrity
+    alert in its own right. Every observed checksum is logged, and is
+    also appended with its time to the state file when one is named
+    with --state. Without --state, the history is kept in the log
+    lines only.
+    """
+    snap = snapshot(filepath)
+    if snap is None:
+        logging.error(f"Failed to get initial checksum for {filepath}. Monitoring aborted.")
+        return False
+    prev_size, prev_hash, _ = snap
+    if initial_checksum is not None:
+        if initial_checksum != prev_hash:
+            logging.warning(f"Checksum for {filepath} has changed!")
+            logging.warning(f"Old checksum: {initial_checksum}")
+            logging.warning(f"New checksum: {prev_hash}")
+        else:
+            logging.info(f"Initial checksum for {filepath}: {prev_hash}")
+    else:
+        logging.info(f"Initial checksum for {filepath}: {prev_hash}")
+    try:
+        append_history(state_file, prev_hash, prev_size)
+    except OSError as e:
+        logging.error(f"Error writing to state file {state_file}: {e}")
+        return False
 
     while True:
         try:
-            current_checksum = calculate_checksum(filepath)
-            if current_checksum is None:
-                logging.error(f"Failed to calculate current checksum for {filepath}. Skipping this check.")
-                time.sleep(interval)
-                continue
-
-            if current_checksum != initial_checksum:
-                logging.warning(f"Checksum for {filepath} has changed!")
-                logging.warning(f"Old checksum: {initial_checksum}")
-                logging.warning(f"New checksum: {current_checksum}")
-                # Implement alerting mechanism here (e.g., send email, trigger webhook)
-
-                #Update initial_checksum for next iteration to avoid spamming alerts
-                initial_checksum = current_checksum
-            else:
-                logging.info(f"Checksum for {filepath} is unchanged.")
-
             time.sleep(interval)
-
+            snap = snapshot(filepath, prefix_limit=prev_size)
+            if snap is None:
+                logging.warning(f"Integrity alert: monitored file is missing or unreadable: {filepath}")
+                continue
+            cur_size, cur_hash, prefix_hash = snap
+            try:
+                append_history(state_file, cur_hash, cur_size)
+            except OSError as e:
+                logging.error(f"Error writing to state file {state_file}: {e}")
+            if cur_size < prev_size:
+                logging.warning(f"Integrity alert: {filepath} shrank from {prev_size} to {cur_size} bytes.")
+                logging.warning(f"Old checksum: {prev_hash}")
+                logging.warning(f"New checksum: {cur_hash}")
+            elif cur_size > prev_size:
+                if prefix_hash != prev_hash:
+                    logging.warning(f"Integrity alert: earlier content of {filepath} changed while the file grew.")
+                    logging.warning(f"Old checksum: {prev_hash}")
+                    logging.warning(f"New checksum: {cur_hash}")
+                else:
+                    logging.info(f"File grew by append: {filepath} size {prev_size} to {cur_size} bytes. New checksum: {cur_hash}")
+            else:
+                if cur_hash != prev_hash:
+                    logging.warning(f"Integrity alert: checksum for {filepath} has changed!")
+                    logging.warning(f"Old checksum: {prev_hash}")
+                    logging.warning(f"New checksum: {cur_hash}")
+                else:
+                    logging.info(f"Checksum for {filepath} is unchanged: {cur_hash}")
+            prev_size, prev_hash = cur_size, cur_hash
         except KeyboardInterrupt:
             logging.info("Monitoring stopped by user.")
             break
         except Exception as e:
             logging.error(f"An unexpected error occurred: {e}")
             break
+    return True
 
 def setup_argparse():
-    """
-    Sets up the command-line argument parser.
-
-    Returns:
-        argparse.ArgumentParser: The argument parser.
-    """
     parser = argparse.ArgumentParser(description="Monitors system logs for integrity by tracking checksums.")
     parser.add_argument("filepath", help="Path to the log file to monitor.")
     parser.add_argument("-i", "--interval", type=int, default=60, help="Interval in seconds to check for changes (default: 60).")
     parser.add_argument("-c", "--checksum", type=str, default=None, help="Initial checksum to compare against. If not provided, it will be calculated.")
+    parser.add_argument("-s", "--state", type=str, default=None, help="Optional state or history file. Every observed checksum is appended to it with its time. If not provided, the checksum history is kept in the log lines only.")
     return parser
 
 def main():
-    """
-    Main function to parse arguments and start the monitoring process.
-    """
     parser = setup_argparse()
     args = parser.parse_args()
-
-    # Input validation
     if not os.path.isfile(args.filepath):
         logging.error(f"Error: File '{args.filepath}' does not exist.")
         sys.exit(1)
-
     if args.interval <= 0:
         logging.error("Error: Interval must be a positive integer.")
         sys.exit(1)
-
-    monitor_file(args.filepath, args.checksum, args.interval)
-
+    checksum = None
+    if args.checksum is not None:
+        checksum = normalise_checksum(args.checksum)
+        if checksum is None:
+            logging.error("Error: Supplied checksum is not a valid SHA256 hex digest.")
+            sys.exit(1)
+    if not monitor_file(args.filepath, checksum, args.interval, args.state):
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
-
-# Usage Examples:
-
-# 1. Monitor a file and calculate the initial checksum:
-# python monitor_logintegrity.py /var/log/syslog
-
-# 2. Monitor a file with a specific interval:
-# python monitor_logintegrity.py /var/log/auth.log -i 300
-
-# 3. Monitor a file with a known initial checksum:
-# python monitor_logintegrity.py /var/log/my_app.log -c "e5b7d4f2c8a9b6e1d0b5c4a3f8e2d1c0a9b8f7e6d5c4b3a2f1e0d9c8b7a6f5e4"
