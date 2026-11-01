@@ -50,6 +50,12 @@ def snapshot(filepath, prefix_limit=None):
     """Returns (size, full_hash, prefix_hash) or None if the file cannot be read."""
     try:
         size = os.path.getsize(filepath)
+        # A snapshot is three separate reads: a size, a full hash,
+        # and later a prefix hash. A file being written while I read
+        # it can give me a size from one moment and hashes from
+        # others, and the growth test below then compares a prefix
+        # of the new file against a hash of a version that may never
+        # have existed whole. Busy logs are exactly where this bites.
         full_hash = hash_bytes_range(filepath)
         prefix_hash = hash_bytes_range(filepath, limit=prefix_limit) if prefix_limit is not None else None
         return size, full_hash, prefix_hash
@@ -62,6 +68,11 @@ def append_history(state_file, checksum, size):
         return
     stamp = datetime.now(timezone.utc).isoformat()
     with open(state_file, 'a', encoding='utf-8') as f:
+        # Every poll appends a line, changed or not, so the history
+        # file grows by one line per interval forever. Pointing the
+        # state option at the monitored file itself is the pathological
+        # case: my own append becomes the file's next change, and
+        # each cycle records growth I caused.
         f.write(f"{stamp} {checksum} size={size}\n")
 
 def normalise_checksum(value):
@@ -92,6 +103,11 @@ def monitor_file(filepath, initial_checksum=None, interval=60, state_file=None):
     prev_size, prev_hash, _ = snap
     if initial_checksum is not None:
         if initial_checksum != prev_hash:
+            # A mismatch against a supplied checksum is announced here
+            # and then monitoring carries on from the file as it now is.
+            # The run does not stop, and the state history absorbs the
+            # new checksum as the next baseline, so the warning at
+            # startup is the only moment the supplied value is enforced.
             logging.warning(f"Checksum for {filepath} has changed!")
             logging.warning(f"Old checksum: {initial_checksum}")
             logging.warning(f"New checksum: {prev_hash}")
@@ -111,6 +127,11 @@ def monitor_file(filepath, initial_checksum=None, interval=60, state_file=None):
             snap = snapshot(filepath, prefix_limit=prev_size)
             if snap is None:
                 logging.warning(f"Integrity alert: monitored file is missing or unreadable: {filepath}")
+                # A missing file alerts on every cycle until it returns, with
+                # no count and no backing off, and my previous state is kept
+                # throughout, so a file that comes back different is judged
+                # against what it was before it vanished, which is the one
+                # part of an outage that stays honest.
                 continue
             cur_size, cur_hash, prefix_hash = snap
             try:
